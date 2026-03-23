@@ -703,10 +703,10 @@ class ClientBot:
             try:
                 log.info("Connecting to signal server...")
                 async with websockets.connect(ws_url, ping_interval=30, ping_timeout=30) as ws:
-                    reconnect_delay = 5
                     log.info("Connected to signal server")
 
                     async for raw in ws:
+                        reconnect_delay = 5  # reset only after receiving data
                         if not self.running:
                             break
                         try:
@@ -723,6 +723,8 @@ class ClientBot:
 
             except websockets.exceptions.ConnectionClosed as e:
                 log.warning(f"WebSocket closed: code={e.code} reason={e.reason}")
+                if e.code == 4029:
+                    reconnect_delay = 65  # server says wait 60s, add buffer
             except (ConnectionRefusedError, OSError) as e:
                 log.warning(f"Connection failed: {type(e).__name__}")
             except Exception as e:
