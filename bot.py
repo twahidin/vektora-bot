@@ -252,7 +252,10 @@ class ClientBot:
                     data = resp.json()
                     PROXY_URL = data["proxy_url"]
                     PROXY_KEY = data["proxy_key"]
+                    whitelist_ip = data.get("whitelist_ip", "")
                     log.info(f"Proxy config fetched from signal server")
+                    if whitelist_ip:
+                        log.info(f"*** IMPORTANT: Whitelist this IP on your Binance API key: {whitelist_ip} ***")
                 else:
                     log.error(f"Failed to fetch proxy config: {resp.status_code}")
         except Exception as e:
