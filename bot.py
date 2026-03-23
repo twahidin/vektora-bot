@@ -51,10 +51,7 @@ SL_PCT = 8.0
 RISK_PER_TRADE_PCT = 5.0
 MAX_POSITIONS = 15
 MIN_HOLD_MINUTES = 60
-FLOOR_LEVELS = {
-    1.2: 0.0, 1.5: 0.3, 2.0: 0.7, 2.5: 1.1,
-    3.0: 1.6, 3.5: 2.1, 4.0: 2.6, 5.0: 3.5,
-}
+FLOOR_LEVELS = {}  # No floors — ride signal flips, SL as safety net only
 
 SIGNAL_SERVER_URL = os.environ.get("SIGNAL_SERVER_URL", "")
 PROXY_URL = os.environ.get("PROXY_URL", "")
@@ -113,15 +110,21 @@ class BinanceProxy:
         return 0.0
 
     async def get_position(self, symbol: str) -> tuple[float, int]:
-        """Get position for symbol. Returns (qty, direction) or (0, 0)."""
+        """Get position for symbol. Returns (qty, direction), (0, 0) if flat,
+        or (-1, 0) on API errors so callers don't mistake errors for closed positions."""
         bsym = binance_symbol(symbol)
-        resp = await self.client.get(
-            f"{PROXY_URL}/v1/position",
-            headers=self._headers(),
-            params={"symbol": bsym},
-        )
+        try:
+            resp = await self.client.get(
+                f"{PROXY_URL}/v1/position",
+                headers=self._headers(),
+                params={"symbol": bsym},
+            )
+        except Exception as e:
+            log.error(f"get_position({symbol}) network error: {e}")
+            return -1.0, 0
         if resp.status_code != 200:
-            return 0.0, 0
+            log.error(f"get_position({symbol}) HTTP {resp.status_code}")
+            return -1.0, 0
         data = resp.json()
         for pos in data:
             if pos.get("symbol") == bsym:
@@ -340,6 +343,9 @@ class ClientBot:
             # Check if position was closed on exchange (SL hit)
             if self.proxy:
                 ex_qty, _ = await self.proxy.get_position(symbol)
+                if ex_qty < 0:
+                    log.warning(f"  {symbol}: exchange API error, skipping position check")
+                    continue
                 if ex_qty == 0:
                     reason = "floor_stop" if pos.get("last_floor", -1) >= 0 else "stop_loss"
                     sl_price = self.protective_orders.get(symbol, {}).get("sl_price", 0)
@@ -453,7 +459,10 @@ class ClientBot:
 
         # Check actual exchange qty
         ex_qty, _ = await self.proxy.get_position(symbol)
-        if ex_qty == 0:
+        if ex_qty < 0:
+            log.warning(f"  {symbol}: exchange API error during close, using local qty")
+            ex_qty = pos["qty"]
+        elif ex_qty == 0:
             log.info(f"  {symbol}: already closed on exchange")
             self._record_close(symbol, close_price, reason)
             return
