@@ -128,6 +128,22 @@ def binance_symbol(symbol: str) -> str:
     return symbol.replace("/", "")
 
 
+# Binance quantity precision per symbol (step size decimals)
+_QTY_PRECISION = {
+    "SUI/USDT": 1, "OP/USDT": 1, "SOL/USDT": 2, "ARB/USDT": 1,
+    "APT/USDT": 2, "FET/USDT": 1, "FIL/USDT": 1, "STX/USDT": 1,
+    "RUNE/USDT": 1, "THETA/USDT": 1, "BNB/USDT": 3, "ETH/USDT": 3,
+    "BTC/USDT": 3, "DOT/USDT": 1, "LINK/USDT": 2, "SAND/USDT": 0,
+    "XLM/USDT": 0, "LTC/USDT": 3,
+}
+
+
+def _round_qty(symbol: str, qty: float) -> float:
+    """Round quantity to Binance's required precision for the symbol."""
+    decimals = _QTY_PRECISION.get(symbol, 3)
+    return round(qty, decimals)
+
+
 # ──────────────────────────────────────────────────────────────
 # Binance Proxy Client
 # ──────────────────────────────────────────────────────────────
@@ -495,8 +511,8 @@ class ClientBot:
             allocation = balance * (RISK_PER_TRADE_PCT / 100)
             notional = allocation * LEVERAGE
             raw_qty = notional / price
-            # Round to reasonable precision (proxy/Binance will reject bad precision)
-            qty = round(raw_qty, 8)
+            # Round quantity to Binance's required precision per symbol
+            qty = _round_qty(symbol, raw_qty)
 
             if qty <= 0:
                 log.error(f"  Calculated qty is 0 for {symbol}")
