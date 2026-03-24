@@ -255,18 +255,17 @@ class BinanceProxy:
     async def place_stop_market(
         self, symbol: str, side: str, qty: float, stop_price: float
     ) -> dict:
-        """Place a stop-market (SL) order."""
+        """Place a stop-market (SL) order via the Algo Order endpoint."""
         bsym = binance_symbol(symbol)
         resp = await self.client.post(
-            f"{PROXY_URL}/v1/order",
+            f"{PROXY_URL}/v1/algoOrder",
             headers=self._headers(),
             json={
                 "symbol": bsym,
                 "side": side.upper(),
                 "type": "STOP_MARKET",
                 "quantity": str(qty),
-                "stopPrice": str(stop_price),
-                "reduceOnly": "true",
+                "triggerPrice": str(stop_price),
             },
         )
         if resp.status_code != 200:
