@@ -267,6 +267,7 @@ class BinanceProxy:
                 "type": "STOP_MARKET",
                 "quantity": str(qty),
                 "triggerPrice": str(stop_price),
+                "reduceOnly": "true",
             },
         )
         if resp.status_code != 200:
