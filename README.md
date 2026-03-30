@@ -1,49 +1,59 @@
-# Vektora Trading Bot
+# Vektora Auto-Trade Bot
 
-Auto-trades Binance Futures based on [Vektora](https://vektora.trade) signal server.
+Auto-trades Binance Futures based on [Vektora](https://vektora.trade) signals, 24/7.
 
 ## Deploy to Railway
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/71c12d88-cf6d-4ad0-b0d3-6c2f0b8b75ef)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.com/deploy/vektora-bot-template?referralCode=rWoFxF)
+
+## Setup
+
+1. Subscribe at [vektora.trade](https://vektora.trade) to get your Signal API key
+2. Create a Binance Futures API key — whitelist IP `208.77.244.15`
+3. Click the deploy button above
+4. Set these 3 variables in Railway:
+
+| Variable | Description |
+|----------|-------------|
+| `SIGNAL_API_KEY` | Your Vektora API key (from subscription email) |
+| `BINANCE_KEY` | Binance Futures API key |
+| `BINANCE_SECRET` | Binance Futures API secret |
+
+5. Deploy — the bot auto-configures and starts trading
+
+## Optional: Telegram Alerts
+
+Add these variables to get trade notifications on Telegram:
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Create a bot via [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_ID` | Get your ID from [@userinfobot](https://t.me/userinfobot) |
 
 ## How It Works
 
-1. Subscribe at [vektora.trade](https://vektora.trade) to get your Signal API key
-2. Deploy this bot on Railway (one click above)
-3. Configure via the `/api/configure` endpoint with your keys
-4. Bot connects to Vektora signal server, receives trading signals, and auto-executes on Binance Futures
-
-## Configuration
-
-After deploying, configure your bot:
-
-```bash
-curl -X POST https://YOUR-BOT-URL/api/configure \
-  -H "Content-Type: application/json" \
-  -d '{
-    "setup_token": "your-chosen-token",
-    "binance_api_key": "...",
-    "binance_secret": "...",
-    "signal_api_key": "issued-by-vektora"
-  }'
-```
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `PROXY_KEY` | Yes | Provided after subscription |
-| `SIGNAL_SERVER_URL` | No | Default: Vektora production server |
-| `PROXY_URL` | No | Default: Vektora Binance proxy |
-
-## Endpoints
-
-- `GET /health` — Bot status (no auth)
-- `POST /api/configure` — Set credentials (first call sets token)
-- `GET /api/status` — Positions and P&L (requires token)
+- Connects to Vektora signal server via WebSocket
+- Receives direction-flip signals for 18 crypto futures pairs
+- Executes trades on your Binance account via secure proxy
+- 5% risk per trade, 10x leverage, 8% stop-loss on every position
+- Runs 24/7 on Railway — auto-reconnects if disconnected
 
 ## Security
 
-- Your Binance API keys are stored locally on YOUR Railway instance
-- Keys are never sent to Vektora — trades execute through an isolated proxy
-- The proxy only signs requests; it never stores credentials
+- Your Binance API keys stay on YOUR Railway instance
+- Keys are never stored on Vektora servers
+- Trades execute through an isolated proxy with IP whitelisting
+- The proxy signs requests in memory — never stores credentials
+
+## API Endpoints
+
+- `GET /health` — Bot status (no auth required)
+
+## Full Setup Guide
+
+[vektora.trade/guide](https://vektora.trade/guide) — step-by-step with Binance account setup, API key creation, and troubleshooting.
+
+## Support
+
+- Email: support@vektora.trade
+- Telegram: [@donchian_alert_bot](https://t.me/donchian_alert_bot)
