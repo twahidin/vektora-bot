@@ -381,12 +381,14 @@ class ClientBot:
 
     async def _status_report_loop(self):
         """Report status to signal server every 60 seconds."""
+        await asyncio.sleep(10)  # first report after 10s
         while self.running:
-            await asyncio.sleep(60)
             try:
                 await self._report_status()
+                log.info("Status report sent to dashboard")
             except Exception as e:
-                log.debug(f"Status report loop error: {e}")
+                log.warning(f"Status report failed: {e}")
+            await asyncio.sleep(60)
 
         # Startup Telegram alert
         try:
@@ -769,7 +771,7 @@ class ClientBot:
                     json=payload,
                 )
         except Exception as e:
-            log.debug(f"Status report failed: {e}")
+            log.warning(f"Status report error: {e}")
 
     def _get_recent_trades(self, limit: int = 20) -> list[dict]:
         """Get recent closed trades from state."""
