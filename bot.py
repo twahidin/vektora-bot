@@ -314,6 +314,18 @@ class ClientBot:
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
         self.alerts = TelegramAlerts()
+        self._events: list[dict] = []
+
+    def _log_event(self, event_type: str, symbol: str, message: str):
+        """Log a bot activity event for the dashboard."""
+        self._events.append({
+            "type": event_type,
+            "symbol": symbol,
+            "message": message,
+            "timestamp": datetime.now().isoformat(),
+        })
+        if len(self._events) > 50:
+            self._events = self._events[-50:]
 
     # ── Setup ─────────────────────────────────────────────────
 
@@ -482,6 +494,7 @@ class ClientBot:
                         f"  {symbol}: WHIPSAW BLOCKED — held only {held_minutes:.0f}m "
                         f"(min {MIN_HOLD_MINUTES}m)"
                     )
+                    self._log_event("whipsaw", symbol, f"Whipsaw blocked — held {held_minutes:.0f}m (min {MIN_HOLD_MINUTES}m)")
                     return
             except (ValueError, KeyError):
                 pass
@@ -609,6 +622,8 @@ class ClientBot:
         }
         self._save_state()
         await self.alerts.position_opened(symbol, direction, price, sl_price, qty, qty * price)
+        dir_label = "LONG" if direction == 1 else "SHORT"
+        self._log_event("open", symbol, f"Opened {dir_label} @ ${price:,.4f}")
 
     async def _close_position(self, symbol: str, close_price: float, reason: str):
         """Close an existing position via the proxy."""
@@ -681,6 +696,9 @@ class ClientBot:
         asyncio.create_task(
             self.alerts.position_closed(symbol, direction, entry_price, close_price, pnl_pct, pnl_dollar, reason)
         )
+
+        reason_label = reason.replace("_", " ").title()
+        self._log_event("close", symbol, f"Closed {dir_label} {pnl_pct:+.2f}% (${pnl_dollar:+,.2f}) — {reason_label}")
 
         # Report trade close to signal server (fire-and-forget)
         try:
@@ -816,6 +834,7 @@ class ClientBot:
                 "positions": positions,
                 "recent_trades": recent,
                 "uptime_seconds": int(time.time() - START_TIME),
+                "events": list(self._events),
             }
 
             async with httpx.AsyncClient(timeout=10.0) as client:
