@@ -380,6 +380,101 @@ class ClientBot:
             await asyncio.sleep(300)
             await self._fetch_symbols()
 
+    async def _sync_positions_with_signals(self):
+        """Sync Binance positions with signal server directions on startup.
+
+        Detects and fixes mismatches: if Binance has a position in the wrong
+        direction vs the signal server, close it and open in the correct direction.
+        Also opens missing positions for symbols that should have one.
+        """
+        if not self.signal_api_key or not self.proxy:
+            return
+
+        http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
+
+        # Fetch current signal directions from server snapshot
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{http_url}/api/snapshot",
+                    params={"key": self.signal_api_key},
+                )
+                if resp.status_code != 200:
+                    log.warning(f"Sync: failed to fetch snapshot ({resp.status_code})")
+                    return
+                snapshot = resp.json()
+        except Exception as e:
+            log.warning(f"Sync: failed to fetch snapshot: {e}")
+            return
+
+        symbols_data = snapshot.get("symbols", {})
+        if not symbols_data:
+            log.info("Sync: no snapshot data available yet")
+            return
+
+        log.info(f"Sync: checking {len(self.active_symbols)} symbols against signal server...")
+        fixed = 0
+
+        for symbol in self.active_symbols:
+            # Get signal direction (try both formats)
+            sig_data = symbols_data.get(f"{symbol}:USDT") or symbols_data.get(symbol)
+            if not sig_data:
+                continue
+            signal_dir = sig_data.get("direction")
+            if signal_dir is None:
+                continue
+            signal_price = sig_data.get("price", 0)
+
+            # Get Binance position
+            ex_qty, ex_dir = await self.proxy.get_position(symbol)
+            if ex_qty < 0:
+                continue  # API error, skip
+
+            tracked = self.positions.get(symbol)
+
+            if ex_qty > 0 and ex_dir != signal_dir:
+                # WRONG DIRECTION — close and reopen
+                dir_label = "LONG" if ex_dir == 1 else "SHORT"
+                new_label = "LONG" if signal_dir == 1 else "SHORT"
+                log.warning(f"  Sync: {symbol} is {dir_label} on Binance but signal says {new_label} — fixing")
+
+                # Cancel existing orders
+                await self.proxy.cancel_all_orders(symbol)
+
+                # Close wrong-direction position
+                close_side = "SELL" if ex_dir == 1 else "BUY"
+                try:
+                    order = await self.proxy.place_market_order(symbol, close_side, ex_qty)
+                    fill_price = float(order.get("avgPrice", signal_price) or signal_price)
+                    log.info(f"  Sync: closed {symbol} {dir_label} @ ${fill_price:.4f}")
+                except Exception as e:
+                    log.error(f"  Sync: failed to close {symbol}: {e}")
+                    continue
+
+                # Remove from internal state
+                self.positions.pop(symbol, None)
+                self.protective_orders.pop(symbol, None)
+                self._log_event("close", symbol, f"Sync: closed {dir_label} (wrong direction)")
+
+                # Open in correct direction
+                sl_pct = SL_PCT / 100
+                new_sl = signal_price * (1 - sl_pct) if signal_dir == 1 else signal_price * (1 + sl_pct)
+                new_sl = _round_price(symbol, new_sl)
+                await self._open_position(symbol, signal_dir, signal_price, new_sl)
+                fixed += 1
+
+            elif ex_qty == 0 and tracked:
+                # Bot thinks it has a position but Binance doesn't — clean up
+                log.warning(f"  Sync: {symbol} tracked locally but not on Binance — cleaning up")
+                self.positions.pop(symbol, None)
+                self.protective_orders.pop(symbol, None)
+
+        self._save_state()
+        if fixed > 0:
+            log.info(f"Sync: fixed {fixed} misaligned position(s)")
+        else:
+            log.info("Sync: all positions aligned")
+
     async def configure(
         self, binance_api_key: str, binance_secret: str,
         signal_api_key: str, testnet: bool = False,
@@ -409,6 +504,7 @@ class ClientBot:
             await self.proxy.set_margin_type(symbol)
 
         self._load_state()
+        await self._sync_positions_with_signals()
         await self._start()
 
     async def _start(self):
@@ -456,6 +552,7 @@ class ClientBot:
                 )
                 await self._fetch_symbols()
                 self._load_state()
+                await self._sync_positions_with_signals()
                 return True
         except Exception as e:
             log.error(f"Failed to load credentials: {e}")
