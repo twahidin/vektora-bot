@@ -131,9 +131,9 @@ def binance_symbol(symbol: str) -> str:
 # Binance Futures precision per symbol: (qty_decimals, price_decimals)
 _PRECISION = {
     "SUI/USDT": (1, 4), "OP/USDT": (1, 4), "SOL/USDT": (2, 2),
-    "ARB/USDT": (1, 4), "APT/USDT": (2, 4), "FET/USDT": (1, 4),
+    "ARB/USDT": (1, 4), "APT/USDT": (1, 4), "FET/USDT": (1, 4),
     "FIL/USDT": (1, 4), "STX/USDT": (1, 4), "RUNE/USDT": (1, 4),
-    "THETA/USDT": (1, 4), "BNB/USDT": (3, 2), "ETH/USDT": (3, 2),
+    "THETA/USDT": (1, 4), "BNB/USDT": (2, 2), "ETH/USDT": (3, 2),
     "BTC/USDT": (3, 1), "DOT/USDT": (1, 3), "LINK/USDT": (2, 3),
     "SAND/USDT": (0, 5), "XLM/USDT": (0, 5), "LTC/USDT": (3, 2),
 }
