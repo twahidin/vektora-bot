@@ -310,6 +310,7 @@ class ClientBot:
         self.positions: dict = {}
         self.protective_orders: dict = {}
         self.active_symbols: list[str] = list(SYMBOLS)
+        self._syncing = False
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
@@ -367,7 +368,7 @@ class ClientBot:
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    self.active_symbols = data["symbols"]
+                    self.active_symbols = [normalize_symbol(s) for s in data["symbols"]]
                     log.info(f"Symbol preferences loaded: {len(self.active_symbols)} of {len(data['available'])} active")
                 else:
                     log.warning(f"Failed to fetch symbols: {resp.status_code}")
@@ -383,13 +384,20 @@ class ClientBot:
     async def _sync_positions_with_signals(self):
         """Sync Binance positions with signal server directions on startup.
 
-        Detects and fixes mismatches: if Binance has a position in the wrong
-        direction vs the signal server, close it and open in the correct direction.
-        Also opens missing positions for symbols that should have one.
+        Checks every active symbol against the signal server snapshot:
+        1. Wrong direction on Binance → close and reopen correctly
+        2. Missing position (flat but signal is active) → open position
+        3. Stale local state (tracked but not on Binance) → clean up
+
+        Only touches the user's Binance account via proxy. Does not affect
+        the signal server's paper trader (separate system).
+
+        Sets self._syncing = True to prevent race conditions with WS handlers.
         """
         if not self.signal_api_key or not self.proxy:
             return
 
+        self._syncing = True
         http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
 
         # Fetch current signal directions from server snapshot
@@ -401,22 +409,28 @@ class ClientBot:
                 )
                 if resp.status_code != 200:
                     log.warning(f"Sync: failed to fetch snapshot ({resp.status_code})")
+                    self._syncing = False
                     return
                 snapshot = resp.json()
         except Exception as e:
             log.warning(f"Sync: failed to fetch snapshot: {e}")
+            self._syncing = False
             return
 
         symbols_data = snapshot.get("symbols", {})
         if not symbols_data:
             log.info("Sync: no snapshot data available yet")
+            self._syncing = False
             return
 
         log.info(f"Sync: checking {len(self.active_symbols)} symbols against signal server...")
         fixed = 0
 
         for symbol in self.active_symbols:
-            # Get signal direction (try both formats)
+            # Normalize symbol to short format (SUI/USDT, not SUI/USDT:USDT)
+            symbol = normalize_symbol(symbol)
+
+            # Get signal direction (try ccxt futures format first)
             sig_data = symbols_data.get(f"{symbol}:USDT") or symbols_data.get(symbol)
             if not sig_data:
                 continue
@@ -425,6 +439,11 @@ class ClientBot:
                 continue
             signal_price = sig_data.get("price", 0)
 
+            # Validate price before any trading actions
+            if not signal_price or signal_price <= 0:
+                log.warning(f"  Sync: {symbol} has invalid price ({signal_price}), skipping")
+                continue
+
             # Get Binance position
             ex_qty, ex_dir = await self.proxy.get_position(symbol)
             if ex_qty < 0:
@@ -432,7 +451,22 @@ class ClientBot:
 
             tracked = self.positions.get(symbol)
 
-            if ex_qty > 0 and ex_dir != signal_dir:
+            if ex_qty > 0 and ex_dir == signal_dir:
+                # Correct direction — ensure it's tracked locally
+                if not tracked:
+                    log.info(f"  Sync: {symbol} on Binance matches signal, adding to local state")
+                    dir_label = "LONG" if signal_dir == 1 else "SHORT"
+                    self.positions[symbol] = {
+                        "direction": signal_dir,
+                        "qty": ex_qty,
+                        "entry_price": signal_price,
+                        "sl_price": 0,
+                        "entry_time": datetime.now().isoformat(),
+                        "max_pnl_pct": 0.0,
+                        "last_floor": -1.0,
+                    }
+
+            elif ex_qty > 0 and ex_dir != signal_dir:
                 # WRONG DIRECTION — close and reopen
                 dir_label = "LONG" if ex_dir == 1 else "SHORT"
                 new_label = "LONG" if signal_dir == 1 else "SHORT"
@@ -469,9 +503,22 @@ class ClientBot:
                 self.positions.pop(symbol, None)
                 self.protective_orders.pop(symbol, None)
 
+            elif ex_qty == 0 and not tracked:
+                # NO POSITION — open in signal direction (if under max positions)
+                if len(self.positions) >= MAX_POSITIONS:
+                    continue
+                dir_label = "LONG" if signal_dir == 1 else "SHORT"
+                log.info(f"  Sync: {symbol} has no position, signal says {dir_label} — opening")
+                sl_pct = SL_PCT / 100
+                new_sl = signal_price * (1 - sl_pct) if signal_dir == 1 else signal_price * (1 + sl_pct)
+                new_sl = _round_price(symbol, new_sl)
+                await self._open_position(symbol, signal_dir, signal_price, new_sl)
+                fixed += 1
+
         self._save_state()
+        self._syncing = False
         if fixed > 0:
-            log.info(f"Sync: fixed {fixed} misaligned position(s)")
+            log.info(f"Sync: fixed {fixed} position(s)")
         else:
             log.info("Sync: all positions aligned")
 
@@ -562,6 +609,9 @@ class ClientBot:
 
     async def handle_signal(self, event: dict):
         """Handle a direction flip signal."""
+        if self._syncing:
+            return  # sync in progress, ignore signals until done
+
         raw_symbol = event["symbol"]
         symbol = normalize_symbol(raw_symbol)
 
@@ -602,6 +652,9 @@ class ClientBot:
 
     async def handle_snapshot(self, snapshot: dict):
         """Handle a 60s snapshot — check SL hits and ratchet profit floors."""
+        if self._syncing:
+            return  # sync in progress, ignore snapshots until done
+
         symbols_data = snapshot.get("symbols", {})
 
         for symbol, pos in list(self.positions.items()):
