@@ -609,6 +609,16 @@ class ClientBot:
             elif command == "resume":
                 self.bot_state = "running"
                 log.info("Bot resumed")
+            elif command.startswith("close_symbol|"):
+                # Peak agent: close a specific symbol
+                symbol = normalize_symbol(command.split("|", 1)[1])
+                await self._agent_close_symbol(symbol)
+            elif command.startswith("skip_symbol|"):
+                # Peak agent: close and skip a symbol for N minutes
+                parts = command.split("|")
+                symbol = normalize_symbol(parts[1]) if len(parts) > 1 else ""
+                duration = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+                await self._agent_skip_symbol(symbol, duration)
 
             # Acknowledge command
             http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
@@ -635,6 +645,37 @@ class ClientBot:
                 await self._close_position(symbol, pos["entry_price"], "command_close_all")
         except Exception as e:
             log.error(f"Close all positions failed: {e}")
+
+    async def _agent_close_symbol(self, symbol: str):
+        """Close a position on behalf of the peak agent (profit-taking)."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            log.info(f"Peak agent close_symbol: {symbol} — no position held, ignoring")
+            return
+        dir_label = "LONG" if pos["direction"] == 1 else "SHORT"
+        log.info(f"Peak agent: closing {symbol} ({dir_label}) — profit-taking at peak")
+        await self._close_position(symbol, pos["entry_price"], "peak_agent")
+        await self.alerts.position_closed(
+            symbol, pos["direction"], pos["entry_price"], pos["entry_price"],
+            0.0, 0.0, "peak_agent"
+        )
+
+    async def _agent_skip_symbol(self, symbol: str, duration_minutes: int):
+        """Close a position and block re-entry for N minutes (whipsaw protection)."""
+        pos = self.positions.get(symbol)
+        if pos:
+            dir_label = "LONG" if pos["direction"] == 1 else "SHORT"
+            log.info(f"Peak agent: skipping {symbol} ({dir_label}) for {duration_minutes}m — whipsaw protection")
+            await self._close_position(symbol, pos["entry_price"], "peak_agent_skip")
+        else:
+            log.info(f"Peak agent skip_symbol: {symbol} — no position, blocking re-entry for {duration_minutes}m")
+
+        # Block re-entry using a time-based skip
+        skip_until = time.time() + duration_minutes * 60
+        if not hasattr(self, "_skip_until"):
+            self._skip_until = {}
+        self._skip_until[symbol] = skip_until
+        log.info(f"Peak agent: {symbol} blocked for {duration_minutes}m")
 
     async def _status_report_loop(self):
         """Report status to signal server every 60 seconds."""
@@ -786,6 +827,17 @@ class ClientBot:
 
     async def _open_position(self, symbol: str, direction: int, price: float, sl_price: float):
         """Open a new position via the proxy."""
+        # Check agent skip
+        if hasattr(self, "_skip_until"):
+            skip_until = self._skip_until.get(symbol, 0)
+            if skip_until > 0 and time.time() < skip_until:
+                remaining = int((skip_until - time.time()) / 60)
+                log.info(f"  {symbol}: blocked by peak agent skip ({remaining}m remaining)")
+                return
+            elif skip_until > 0:
+                # Skip expired — clear it
+                del self._skip_until[symbol]
+
         if len(self.positions) >= MAX_POSITIONS:
             log.warning(f"  Max positions ({MAX_POSITIONS}) reached, skipping {symbol}")
             return
