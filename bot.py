@@ -900,6 +900,14 @@ class ClientBot:
         entry_price = pos["entry_price"]
         direction = pos["direction"]
 
+        # Guard against zero/invalid prices
+        if close_price <= 0 or entry_price <= 0:
+            log.warning(f"  {symbol}: skipping P&L calc — invalid prices (entry={entry_price}, close={close_price})")
+            self._save_state()
+            dir_label = "LONG" if direction == 1 else "SHORT"
+            self._log_event("close", symbol, f"Closed {dir_label} — price unavailable")
+            return
+
         if direction == 1:
             pnl_pct = (close_price - entry_price) / entry_price * 100
         else:
