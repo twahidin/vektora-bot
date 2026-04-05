@@ -863,10 +863,17 @@ class ClientBot:
                     log.warning(f"  {symbol}: exchange API error, skipping position check")
                     continue
                 if ex_qty == 0:
-                    reason = "floor_stop" if pos.get("last_floor", -1) >= 0 else "stop_loss"
+                    # Check if bot initiated this close (recently closed set)
+                    if hasattr(self, '_recently_closed') and symbol in self._recently_closed:
+                        self._recently_closed.discard(symbol)
+                        self.positions.pop(symbol, None)
+                        self.protective_orders.pop(symbol, None)
+                        continue
+                    # Not bot-initiated — external close (manual, liquidation, etc.)
+                    reason = "external_close"
                     sl_price = self.protective_orders.get(symbol, {}).get("sl_price", 0)
                     close_price = sl_price if sl_price > 0 else current_price
-                    log.info(f"  {symbol}: position closed on exchange ({reason}) @ ${close_price:.4f}")
+                    log.info(f"  {symbol}: position closed externally @ ${close_price:.4f}")
                     self._record_close(symbol, close_price, reason)
                     continue
 
@@ -983,6 +990,10 @@ class ClientBot:
 
     async def _close_position(self, symbol: str, close_price: float, reason: str):
         """Close an existing position via the proxy."""
+        # Track bot-initiated closes so snapshot handler doesn't re-process
+        if not hasattr(self, '_recently_closed'):
+            self._recently_closed = set()
+        self._recently_closed.add(symbol)
         pos = self.positions.get(symbol)
         if not pos or not self.proxy:
             return
@@ -1062,7 +1073,15 @@ class ClientBot:
         )
 
         reason_label = reason.replace("_", " ").title()
-        self._log_event("close", symbol, f"Closed {dir_label} {pnl_pct:+.2f}% (${pnl_dollar:+,.2f}) — {reason_label}")
+        # Map close reasons to specific event types for dashboard icons
+        event_type_map = {
+            "peak_agent": "agent_close", "bot_agent_peak": "agent_close",
+            "peak_agent_skip": "agent_skip", "bot_agent_skip": "agent_skip",
+            "signal_flip": "signal_flip", "missed_flip": "signal_flip",
+            "external_close": "external_close",
+        }
+        event_type = event_type_map.get(reason, "close")
+        self._log_event(event_type, symbol, f"Closed {dir_label} {pnl_pct:+.2f}% (${pnl_dollar:+,.2f}) — {reason_label}")
 
         # Report trade close to signal server (fire-and-forget)
         try:
