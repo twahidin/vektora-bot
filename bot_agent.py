@@ -12,7 +12,6 @@ Actions:
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -24,7 +23,8 @@ log = logging.getLogger("bot-agent")
 
 SIGNAL_SERVER_URL = os.getenv("SIGNAL_SERVER_URL", "wss://signal-server-production-1802.up.railway.app")
 AGENT_INTERVAL_SECONDS = int(os.getenv("AGENT_INTERVAL_SECONDS", "300"))  # 5 min
-MIN_PROFIT_PCT_TO_CLOSE = 2.0
+LEVERAGE = 10
+MIN_PROFIT_PCT_TO_CLOSE = 2.0  # leveraged ROI % (0.2% raw price move at 10x)
 COOLDOWN_SECONDS = 1800  # 30 min
 
 
@@ -64,10 +64,10 @@ class BotPeakAgent:
             qty = pos.get("qty", 0)
             dm = 1 if direction == 1 else -1
 
-            # Real P&L from actual position
-            pnl_pct = dm * (price - entry_price) / entry_price * 100
-            notional = qty * entry_price if qty else 0
-            pnl_usd = dm * (price - entry_price) / entry_price * notional * 10  # 10x leverage
+            # Real P&L from actual position (leveraged ROI — matches server-side agent)
+            pnl_pct = dm * (price - entry_price) / entry_price * 100 * LEVERAGE
+            notional = qty * entry_price if qty else 0  # already includes leverage
+            pnl_usd = dm * (price - entry_price) / entry_price * notional
 
             unrealized_total += pnl_usd
             if pnl_usd > 0:
@@ -244,7 +244,8 @@ class BotPeakAgent:
                 pos = self.bot.positions.get(symbol)
                 if pos:
                     log.info(f"Bot agent: CLOSING {symbol}")
-                    await self.bot._close_position(symbol, pos["entry_price"], "bot_agent_peak")
+                    close_price = self.bot.last_prices.get(symbol, pos["entry_price"])
+                    await self.bot._close_position(symbol, close_price, "bot_agent_peak")
                     # Block re-entry until next signal flip
                     if not hasattr(self.bot, "_agent_paused"):
                         self.bot._agent_paused = set()
@@ -260,7 +261,8 @@ class BotPeakAgent:
                 pos = self.bot.positions.get(symbol)
                 if pos:
                     log.info(f"Bot agent: SKIPPING {symbol} for {duration}m")
-                    await self.bot._close_position(symbol, pos["entry_price"], "bot_agent_skip")
+                    close_price = self.bot.last_prices.get(symbol, pos["entry_price"])
+                    await self.bot._close_position(symbol, close_price, "bot_agent_skip")
                 # Block re-entry (time-based)
                 if not hasattr(self.bot, "_skip_until"):
                     self.bot._skip_until = {}
