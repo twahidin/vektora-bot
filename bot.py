@@ -316,8 +316,12 @@ class ClientBot:
         self.session_pnl = 0.0
         self.consecutive_losses: dict = {}
         self._ws_task: asyncio.Task | None = None
+        self._agent_task: asyncio.Task | None = None
         self.alerts = TelegramAlerts()
         self._events: list[dict] = []
+        self._last_snapshot_symbols: dict = {}  # for agent: indicator state per symbol
+        self._signal_history: list[dict] = []   # for agent: recent signal flips with timestamps
+        self._last_balance: float = 0.0         # for agent: last known wallet balance
 
     def _log_event(self, event_type: str, symbol: str, message: str):
         """Log a bot activity event for the dashboard."""
@@ -383,10 +387,27 @@ class ClientBot:
             await asyncio.sleep(300)
             await self._fetch_symbols()
 
+    async def _cleanup_orphaned_orders(self):
+        """Cancel ALL conditional orders across all symbols on startup.
+        Prevents orphaned SL orders from accumulating across restarts."""
+        if not self.proxy:
+            return
+        log.info("Cleanup: cancelling all conditional orders across all symbols...")
+        cancelled = 0
+        for symbol in SYMBOLS:
+            symbol = normalize_symbol(symbol)
+            try:
+                await self.proxy.cancel_all_orders(symbol)
+                cancelled += 1
+            except Exception as e:
+                log.warning(f"Cleanup: failed to cancel orders for {symbol}: {e}")
+        log.info(f"Cleanup: cancelled orders for {cancelled} symbols")
+
     async def _sync_positions_with_signals(self):
         """Sync Binance positions with signal server directions on startup.
 
         Checks every active symbol against the signal server snapshot:
+        0. Cancel ALL orphaned conditional orders first
         1. Wrong direction on Binance → close and reopen correctly
         2. Missing position (flat but signal is active) → open position
         3. Stale local state (tracked but not on Binance) → clean up
@@ -400,6 +421,15 @@ class ClientBot:
             return
 
         self._syncing = True
+
+        # If bot is paused, don't sync — it would reopen positions
+        if self.bot_state != "running":
+            log.info(f"Sync: skipping — bot is {self.bot_state}")
+            self._syncing = False
+            return
+
+        # Step 0: Cancel all orphaned orders before sync
+        await self._cleanup_orphaned_orders()
         http_url = SIGNAL_SERVER_URL.replace("wss://", "https://").replace("ws://", "http://")
 
         # Fetch current signal directions from server snapshot
@@ -557,7 +587,7 @@ class ClientBot:
         await self._start()
 
     async def _start(self):
-        """Start the WS connection loop and status reporting."""
+        """Start the WS connection loop, status reporting, and AI agent."""
         self.running = True
         self.status = "running"
         self._ws_task = asyncio.create_task(self._connect_signal_server())
@@ -565,6 +595,13 @@ class ClientBot:
         self._symbol_refresh_task = asyncio.create_task(self._symbol_refresh_loop())
         self._periodic_sync_task = asyncio.create_task(self._periodic_sync_loop())
         self._command_poll_task = asyncio.create_task(self._poll_commands())
+
+        # Start AI peak agent (calls signal server for evaluation — no API key needed)
+        from bot_agent import BotPeakAgent
+        self._bot_agent = BotPeakAgent(self)
+        self._agent_task = asyncio.create_task(self._bot_agent.run())
+        log.info("AI peak agent started (server-side evaluation)")
+
         log.info("Bot started")
 
     async def _periodic_sync_loop(self):
@@ -647,7 +684,8 @@ class ClientBot:
             log.error(f"Close all positions failed: {e}")
 
     async def _agent_close_symbol(self, symbol: str):
-        """Close a position on behalf of the peak agent (profit-taking)."""
+        """Close a position on behalf of the peak agent (profit-taking).
+        Blocks re-entry until next signal flip by adding to _agent_paused."""
         pos = self.positions.get(symbol)
         if not pos:
             log.info(f"Peak agent close_symbol: {symbol} — no position held, ignoring")
@@ -655,6 +693,11 @@ class ClientBot:
         dir_label = "LONG" if pos["direction"] == 1 else "SHORT"
         log.info(f"Peak agent: closing {symbol} ({dir_label}) — profit-taking at peak")
         await self._close_position(symbol, pos["entry_price"], "peak_agent")
+        # Block re-entry until next signal flip (mirrors engine.paused_symbols)
+        if not hasattr(self, "_agent_paused"):
+            self._agent_paused = set()
+        self._agent_paused.add(symbol)
+        log.info(f"Peak agent: {symbol} paused until next signal flip")
         await self.alerts.position_closed(
             symbol, pos["direction"], pos["entry_price"], pos["entry_price"],
             0.0, 0.0, "peak_agent"
@@ -743,6 +786,11 @@ class ClientBot:
 
         log.info(f"SIGNAL: {symbol} -> {dir_label} @ ${price:.4f} (SL ${sl_price:.4f})")
 
+        # Track signal for agent's whipsaw detection
+        self._signal_history.append({"symbol": symbol, "ts": time.time(), "direction": direction})
+        if len(self._signal_history) > 200:
+            self._signal_history = self._signal_history[-200:]
+
         existing = self.positions.get(symbol)
 
         if existing and existing["direction"] == direction:
@@ -766,6 +814,19 @@ class ClientBot:
 
             await self._close_position(symbol, price, "signal_flip")
 
+        # Check agent pause (CLOSE action — clears on signal flip)
+        if hasattr(self, "_agent_paused") and symbol in self._agent_paused:
+            self._agent_paused.discard(symbol)
+            log.info(f"  {symbol}: agent pause cleared — signal flipped, allowing re-entry")
+
+        # Check agent skip (SKIP action — time-based, ignores flips)
+        if hasattr(self, "_skip_until"):
+            skip_until = self._skip_until.get(symbol, 0)
+            if skip_until > 0 and time.time() < skip_until:
+                remaining = int((skip_until - time.time()) / 60)
+                log.info(f"  {symbol}: SKIPPED by agent — {remaining}m remaining, not opening")
+                return
+
         await self._open_position(symbol, direction, price, sl_price)
 
     async def handle_snapshot(self, snapshot: dict):
@@ -775,11 +836,18 @@ class ClientBot:
 
         symbols_data = snapshot.get("symbols", {})
 
+        # Store full snapshot for agent (indicator state per symbol)
+        self._last_snapshot_symbols = symbols_data
+
         # Update last known prices for unrealized P&L calculation
         for sym_key, sym_data in symbols_data.items():
             clean_sym = sym_key.replace(":USDT", "")
             if "price" in sym_data:
                 self.last_prices[clean_sym] = sym_data["price"]
+
+        # Don't process positions if bot is paused
+        if self.bot_state != "running":
+            return
 
         for symbol, pos in list(self.positions.items()):
             data = symbols_data.get(symbol) or symbols_data.get(f"{symbol}:USDT")
@@ -827,7 +895,11 @@ class ClientBot:
 
     async def _open_position(self, symbol: str, direction: int, price: float, sl_price: float):
         """Open a new position via the proxy."""
-        # Check agent skip
+        # Check agent pause (profit-taking — clears on signal flip)
+        if hasattr(self, "_agent_paused") and symbol in self._agent_paused:
+            log.info(f"  {symbol}: blocked by peak agent (paused until next flip)")
+            return
+        # Check agent skip (whipsaw — time-based)
         if hasattr(self, "_skip_until"):
             skip_until = self._skip_until.get(symbol, 0)
             if skip_until > 0 and time.time() < skip_until:
@@ -1130,6 +1202,9 @@ class ClientBot:
                             break
             except Exception:
                 pass
+            # Store for agent
+            if balance > 0:
+                self._last_balance = balance
 
             # Recent trades (last 20)
             recent = self._get_recent_trades(20)
