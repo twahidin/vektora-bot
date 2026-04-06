@@ -830,9 +830,9 @@ class ClientBot:
             self.consecutive_losses[symbol] = 0
 
         # Classify zone
-        if adx > 25 and bb_w > 2.5:
+        if adx > 25 and bb_w > 3.5:
             zone = "trending"
-        elif adx < 20 or bb_w < 2.0:
+        elif adx < 20 or bb_w < 3.0:
             zone = "consolidating"
         else:
             zone = "grey"
