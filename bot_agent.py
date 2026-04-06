@@ -182,7 +182,52 @@ class BotPeakAgent:
             "cooldown_active": cooldown_remaining > 0,
             "cooldown_remaining_minutes": round(cooldown_remaining / 60, 1),
             "cycle_number": self._cycle_count,
+            "pending_flips": self._build_pending_flips(),
         }
+
+    def _build_pending_flips(self) -> list:
+        """Build pending flips payload from bot's blocked signals."""
+        if not hasattr(self.bot, '_pending_flips') or not self.bot._pending_flips:
+            return []
+
+        pending = []
+        snap_data = getattr(self.bot, '_last_snapshot_symbols', {})
+
+        for symbol, pf in list(self.bot._pending_flips.items()):
+            pos = self.bot.positions.get(symbol, {})
+            pos_dir = pos.get("direction", 0)
+
+            # Get fresh indicators from latest snapshot
+            snap = snap_data.get(f"{symbol}:USDT") or snap_data.get(symbol) or {}
+            don_dir = snap.get("don_dir", 0)
+            bb_dir = snap.get("bb_dir", 0)
+            sig_dir = pf["signal_direction"]
+            both_agree = (don_dir == sig_dir and bb_dir == sig_dir)
+
+            pending.append({
+                "symbol": symbol,
+                "position_direction": "LONG" if pos_dir == 1 else "SHORT",
+                "signal_direction": "LONG" if sig_dir == 1 else "SHORT",
+                "consecutive_losses": pf.get("consecutive_losses", 0),
+                "seconds_since_blocked": round(time.time() - pf["blocked_at"]),
+                "both_indicators_agree": both_agree,
+                "unrealized_pnl_pct": 0,
+                "bb_width": snap.get("bb_width", pf.get("bb_width", 0)),
+                "adx": snap.get("adx", pf.get("adx", 0)),
+                "atr_pct": snap.get("atr_pct", 0),
+                "donchian_width": snap.get("don_width", 0),
+            })
+
+            # Compute unrealized PnL for the held position
+            price = self.bot.last_prices.get(symbol, 0)
+            entry = pos.get("entry_price", 0)
+            if price > 0 and entry > 0 and pos_dir != 0:
+                dm = 1 if pos_dir == 1 else -1
+                pending[-1]["unrealized_pnl_pct"] = round(
+                    dm * (price - entry) / entry * 100 * LEVERAGE, 2
+                )
+
+        return pending
 
     async def _evaluate(self, payload: dict) -> dict:
         """Call signal server's /api/agent-evaluate — Qwen key stays server-side."""
@@ -220,8 +265,62 @@ class BotPeakAgent:
         if cleaned > 0:
             log.info(f"Bot agent: cleaned orphaned orders for {cleaned} untracked symbols")
 
+    async def _execute_pending_flips(self, decision: dict, payload: dict):
+        """Execute agent decisions on consolidation-blocked flips."""
+        flip_actions = decision.get("pending_flip_actions", [])
+        if not flip_actions or not hasattr(self.bot, '_pending_flips'):
+            return
+
+        for fa in flip_actions:
+            symbol = fa.get("symbol", "")
+            action = fa.get("action", "")
+            pf = self.bot._pending_flips.get(symbol)
+            if not pf:
+                continue
+
+            if action == "FLIP":
+                # Agent approves the blocked flip — execute it
+                log.info(f"Bot agent: APPROVED FLIP {symbol} → {'LONG' if pf['signal_direction'] == 1 else 'SHORT'}")
+                pos = self.bot.positions.get(symbol)
+                if pos:
+                    close_price = self.bot.last_prices.get(symbol, pos["entry_price"])
+                    await self.bot._close_position(symbol, close_price, "agent_approved_flip")
+                current_price = self.bot.last_prices.get(symbol, pf["signal_price"])
+                await self.bot._open_position(symbol, pf["signal_direction"], current_price, pf["sl_price"])
+                self.bot.consecutive_losses[symbol] = 0
+                self.bot._pending_flips.pop(symbol, None)
+
+            elif action == "CLOSE":
+                # Agent says go flat — close position, don't re-enter
+                log.info(f"Bot agent: CLOSE FLAT {symbol} — consolidation too risky")
+                pos = self.bot.positions.get(symbol)
+                if pos:
+                    close_price = self.bot.last_prices.get(symbol, pos["entry_price"])
+                    await self.bot._close_position(symbol, close_price, "agent_close_consolidation")
+                self.bot._pending_flips.pop(symbol, None)
+
+            elif action == "HOLD":
+                # Keep position as-is, remove from pending (signal was noise)
+                log.info(f"Bot agent: HOLD {symbol} — still consolidating")
+                # Check if signal direction now matches position — clear pending
+                pos = self.bot.positions.get(symbol)
+                if pos and pos.get("direction") == pf["signal_direction"]:
+                    self.bot._pending_flips.pop(symbol, None)
+                # Otherwise keep in pending for next cycle
+
+        # Auto-clear stale pending flips (blocked > 1 hour)
+        if hasattr(self.bot, '_pending_flips'):
+            stale = [s for s, pf in self.bot._pending_flips.items()
+                     if time.time() - pf["blocked_at"] > 3600]
+            for s in stale:
+                log.info(f"Bot agent: clearing stale pending flip for {s}")
+                self.bot._pending_flips.pop(s, None)
+
     async def _execute_decision(self, decision: dict, payload: dict):
         """Execute agent decisions on actual Binance positions."""
+        # Handle pending flip decisions first
+        await self._execute_pending_flips(decision, payload)
+
         actions = decision.get("actions", [])
         if not actions:
             log.info(f"Bot agent #{self._cycle_count}: HOLD — {decision.get('reasoning', '')[:100]}")

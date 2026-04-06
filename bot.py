@@ -334,6 +334,23 @@ class ClientBot:
         if len(self._events) > 50:
             self._events = self._events[-50:]
 
+    def _add_pending_flip(self, symbol: str, direction: int, price: float,
+                          sl_price: float, adx: float, bb_w: float, zone: str):
+        """Queue a blocked flip for AI agent evaluation."""
+        if not hasattr(self, '_pending_flips'):
+            self._pending_flips = {}
+        self._pending_flips[symbol] = {
+            "signal_direction": direction,
+            "signal_price": price,
+            "sl_price": sl_price,
+            "blocked_at": time.time(),
+            "adx": adx,
+            "bb_width": bb_w,
+            "zone": zone,
+            "consecutive_losses": self.consecutive_losses.get(symbol, 0),
+        }
+        log.info(f"  {symbol}: added to pending_flips (zone={zone}, ADX={adx:.0f}, BBW={bb_w:.1f}%)")
+
     # ── Setup ─────────────────────────────────────────────────
 
     async def _fetch_proxy_config(self, signal_api_key: str):
@@ -797,21 +814,47 @@ class ClientBot:
             log.info(f"  Already {dir_label} on {symbol}, skipping")
             return
 
-        # Anti-whipsaw: enforce minimum hold time
-        if existing:
-            try:
-                entry_time = datetime.fromisoformat(existing["entry_time"])
-                held_minutes = (datetime.now() - entry_time).total_seconds() / 60
-                if held_minutes < MIN_HOLD_MINUTES:
-                    log.warning(
-                        f"  {symbol}: WHIPSAW BLOCKED — held only {held_minutes:.0f}m "
-                        f"(min {MIN_HOLD_MINUTES}m)"
-                    )
-                    self._log_event("whipsaw", symbol, f"Whipsaw blocked — held {held_minutes:.0f}m (min {MIN_HOLD_MINUTES}m)")
-                    return
-            except (ValueError, KeyError):
-                pass
+        # ── Consolidation gate: block flips in choppy markets ──
+        snap = {}
+        if hasattr(self, '_last_snapshot_symbols'):
+            snap = self._last_snapshot_symbols.get(f"{symbol}:USDT") or \
+                   self._last_snapshot_symbols.get(symbol) or {}
+        adx = snap.get("adx", 50)          # default trending (safe)
+        bb_w = snap.get("bb_width", 5.0)   # default wide (safe)
 
+        # Decay consecutive losses after 1 hour
+        if not hasattr(self, '_last_loss_ts'):
+            self._last_loss_ts = {}
+        last_loss = self._last_loss_ts.get(symbol, 0)
+        if last_loss > 0 and (time.time() - last_loss) > 3600:
+            self.consecutive_losses[symbol] = 0
+
+        # Classify zone
+        if adx > 25 and bb_w > 2.5:
+            zone = "trending"
+        elif adx < 20 or bb_w < 2.0:
+            zone = "consolidating"
+        else:
+            zone = "grey"
+
+        # Block logic
+        if zone == "consolidating":
+            self._add_pending_flip(symbol, direction, price, sl_price, adx, bb_w, zone)
+            self._log_event("whipsaw_blocked", symbol,
+                f"Flip to {dir_label} blocked — consolidating (ADX={adx:.0f}, BBW={bb_w:.1f}%)")
+            log.info(f"  {symbol}: CONSOLIDATION BLOCK — ADX={adx:.0f}, BBW={bb_w:.1f}%, queued for agent")
+            return
+
+        if zone == "grey" and self.consecutive_losses.get(symbol, 0) >= 2:
+            losses = self.consecutive_losses[symbol]
+            self._add_pending_flip(symbol, direction, price, sl_price, adx, bb_w, zone)
+            self._log_event("whipsaw_blocked", symbol,
+                f"Flip to {dir_label} blocked — grey zone + {losses} consecutive losses")
+            log.info(f"  {symbol}: GREY ZONE BLOCK — {losses} losses, ADX={adx:.0f}, BBW={bb_w:.1f}%, queued for agent")
+            return
+
+        # ── Trending or grey with <2 losses: execute normally ──
+        if existing:
             await self._close_position(symbol, price, "signal_flip")
 
         # Check agent pause (CLOSE action — clears on signal flip)
@@ -1056,6 +1099,9 @@ class ClientBot:
 
         if pnl_pct < 0:
             self.consecutive_losses[symbol] = self.consecutive_losses.get(symbol, 0) + 1
+            if not hasattr(self, '_last_loss_ts'):
+                self._last_loss_ts = {}
+            self._last_loss_ts[symbol] = time.time()
         else:
             self.consecutive_losses[symbol] = 0
 
