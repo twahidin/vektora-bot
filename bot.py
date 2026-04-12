@@ -94,7 +94,7 @@ DEFAULT_CONFIG = {
     "taker_fee": 0.0005,      # 0.05%
     "candle_lookback": 200,   # candles to fetch (must be > don_period)
     "check_interval_seconds": 60,
-    "max_positions": 18,
+    "max_positions": 5,
     "ai_intervention": False,
     # Risk management (SL8/TP0/Floors — backtest-validated best balance)
     "sl_pct": 8.0,            # stop loss 8% from entry (saves 20% margin before liquidation)
