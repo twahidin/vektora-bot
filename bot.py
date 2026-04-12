@@ -935,6 +935,47 @@ class ComboBot:
 
 
 # ──────────────────────────────────────────────────────────────
+# FastAPI app for Railway (health check + bot runs in background thread)
+# ──────────────────────────────────────────────────────────────
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+_bot_instance = None
+
+
+@asynccontextmanager
+async def lifespan(application):
+    """Start bot in background thread on startup."""
+    global _bot_instance
+    import threading
+    bot = ComboBot(testnet=False)
+    if bot.connect():
+        _bot_instance = bot
+        t = threading.Thread(target=bot.run, daemon=True)
+        t.start()
+        log.info("Bot started in background thread")
+    else:
+        log.error("Bot failed to connect — running without trading")
+    yield
+    if _bot_instance:
+        _bot_instance.running = False
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    if _bot_instance:
+        return {
+            "status": "running",
+            "positions": len(_bot_instance.positions),
+            "uptime": int(time.time() - _bot_instance._start_time),
+        }
+    return {"status": "not_connected"}
+
+
+# ──────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────
 def main():
