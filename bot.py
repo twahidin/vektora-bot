@@ -490,27 +490,35 @@ class ClientBot:
             tracked = self.positions.get(symbol)
 
             if ex_qty > 0 and ex_dir == signal_dir:
-                # Correct direction — ensure it's tracked locally
-                if not tracked:
-                    # Use signal_price as entry estimate; if unavailable, fetch from proxy
-                    entry_est = signal_price
-                    if entry_est <= 0:
-                        try:
-                            last_price = self.last_prices.get(symbol, 0)
-                            if last_price > 0:
-                                entry_est = last_price
-                            else:
-                                log.warning(f"  Sync: {symbol} has no valid price, skipping")
-                                continue
-                        except Exception:
-                            continue
-                    log.info(f"  Sync: {symbol} on Binance matches signal, adding to local state")
+                # Correct direction — re-place the SL that _cleanup_orphaned_orders wiped,
+                # then ensure it's tracked locally.
+                sl_pct = SL_PCT / 100
+                new_sl = signal_price * (1 - sl_pct) if signal_dir == 1 else signal_price * (1 + sl_pct)
+                new_sl = _round_price(symbol, new_sl)
+                close_side = "SELL" if signal_dir == 1 else "BUY"
+                sl_placed = False
+                try:
+                    await self.proxy.place_stop_market(symbol, close_side, ex_qty, new_sl)
+                    self.protective_orders[symbol] = {"sl_price": new_sl}
+                    sl_placed = True
+                    log.info(f"  Sync: {symbol} SL re-placed @ ${new_sl:.4f}")
+                except Exception as e:
+                    log.error(f"  Sync: SL re-place FAILED for {symbol} — position is UNPROTECTED: {e}")
+
+                entry_est = (tracked or {}).get("entry_price", 0) or signal_price
+                if entry_est <= 0:
+                    entry_est = self.last_prices.get(symbol, 0) or signal_price
+                if tracked:
+                    tracked["qty"] = ex_qty
+                    tracked["sl_price"] = new_sl if sl_placed else 0
+                else:
                     dir_label = "LONG" if signal_dir == 1 else "SHORT"
+                    log.info(f"  Sync: {symbol} on Binance matches signal, adding to local state")
                     self.positions[symbol] = {
                         "direction": signal_dir,
                         "qty": ex_qty,
                         "entry_price": entry_est,
-                        "sl_price": 0,
+                        "sl_price": new_sl if sl_placed else 0,
                         "entry_time": datetime.now().isoformat(),
                     }
 
