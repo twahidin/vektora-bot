@@ -788,6 +788,33 @@ class ClientBot:
 
         await self._open_position(symbol, direction, price, sl_price)
 
+    async def handle_close(self, event: dict):
+        """Handle a server-initiated close command (e.g. profit_lock trigger).
+
+        The signal server's Profit Lock logic sends {"type":"close","symbol":X,"reason":Y}
+        when a tracked position retraces past its configured pullback threshold from peak.
+        We close at the last known market price; _close_position fetches the real
+        fill price from the exchange when the market order returns.
+        """
+        if self.bot_state != "running":
+            log.info(f"Ignoring close command (bot state: {self.bot_state})")
+            return
+        if self._syncing:
+            return
+
+        raw_symbol = event.get("symbol", "")
+        symbol = normalize_symbol(raw_symbol)
+        reason = event.get("reason", "server_close")
+
+        if symbol not in self.positions:
+            log.info(f"Close command for {symbol} — no tracked position, ignoring")
+            return
+
+        current_price = self.last_prices.get(symbol, 0) or self.positions[symbol].get("entry_price", 0)
+        dir_label = "LONG" if self.positions[symbol]["direction"] == 1 else "SHORT"
+        log.info(f"CLOSE CMD: {symbol} ({dir_label}) @ ~${current_price:.4f} reason={reason}")
+        await self._close_position(symbol, current_price, reason)
+
     async def handle_snapshot(self, snapshot: dict):
         """Handle a 60s snapshot — check SL hits and detect missed flips."""
         if self._syncing:
@@ -1177,6 +1204,8 @@ class ClientBot:
                                 await self.handle_signal(msg)
                             elif msg_type == "snapshot":
                                 await self.handle_snapshot(msg)
+                            elif msg_type == "close":
+                                await self.handle_close(msg)
                         except json.JSONDecodeError:
                             log.warning(f"Invalid JSON: {raw[:100]}")
                         except Exception as e:
